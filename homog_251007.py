@@ -473,6 +473,8 @@ def main():
     Aop = df.assemble(a_spd)
     print(" done.")
 
+
+    # TEST
     # Nullspace of translations
     rb = []
     for i in range(3):
