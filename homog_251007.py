@@ -319,9 +319,13 @@ def _beams_from_voronoi_module(Vmodule, beam_diam):
         beams.append((p0, p1, r))
     return beams
 
-# ================================ main ===================================
-def main():
+# ------------------- in-process API (for optimization) -------------------
+def build_argparser():
     ap = argparse.ArgumentParser(description="Homog bricks, Voronoi-driven geometry (fixed A/B/C)")
+    ap.add_argument("--verbose", type=int, default=1, help="1=print steps, 0=quiet (optimization-friendly)")
+    ap.add_argument("--return-energy", type=int, default=0,
+                help="1=compute and return DG0 energy maps for E11/E22/E33 (for semi-adjoint)")
+
     # Flags
     ap.add_argument("--qorder", type=int, choices=[1,4], default=1, help="Quadrature points per tetra for φ painter")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bars")
@@ -345,7 +349,6 @@ def main():
     # Smooth material field
     ap.add_argument("--beta", type=float, default=10.0)
     ap.add_argument("--thresh", type=float, default=0.5)
-    # # # # # ap.add_argument("--E-solid", type=float, default=210.0e3)
     ap.add_argument("--E-solid", type=float, default=1.0)
     ap.add_argument("--E-void", type=float, default=1e-6)
     ap.add_argument("--nu", type=float, default=0.30)
@@ -354,21 +357,43 @@ def main():
     # Solver backend options
     ap.add_argument("--pc", choices=["hypre","gamg"], default="hypre", help="AMG preconditioner backend")
     ap.add_argument("--rtol", type=float, default=1e-8, help="Krylov relative tolerance")
-
-    # --- NEW: Fixed A/B/C (periodic wrap) ---
+    # Fixed A/B/C
     ap.add_argument("--fixed-abc", type=int, default=1, help="If 1, use fixed A,B,C provided below")
-    ap.add_argument("--A", type=float, nargs=3, metavar=("AX","AY","AZ"), default=[0.1, 0.1, 0.1], help="Coordinates of point A in [0,1)")
-    ap.add_argument("--B", type=float, nargs=3, metavar=("BX","BY","BZ"), default=[0.9, 0.9, 0.9], help="Coordinates of point B in [0,1)")
-    ap.add_argument("--C", type=float, nargs=3, metavar=("CX","CY","CZ"), default=[0.5, 0.55, 0.5], help="Coordinates of point C in [0,1)")
+    ap.add_argument("--A", type=float, nargs=3, metavar=("AX","AY","AZ"), default=[0.1, 0.1, 0.1])
+    ap.add_argument("--B", type=float, nargs=3, metavar=("BX","BY","BZ"), default=[0.9, 0.9, 0.9])
+    ap.add_argument("--C", type=float, nargs=3, metavar=("CX","CY","CZ"), default=[0.5, 0.55, 0.5])
     ap.add_argument("--eps-rest", type=float, default=0.03, help="Min torus distance when filling remaining points")
 
-    args = ap.parse_args()
+    # NEW: allow turning file output on/off (important for optimization loops)
+    ap.add_argument("--save-outputs", type=int, default=1, help="1=write XDMF/OBJ/CSV, 0=silent (faster for loops)")
+
+    return ap
+
+
+
+
+
+def run_homog(args, engine=None):
+    """
+    Core routine. Runs steps 1-4 and returns:
+      C_sym (6x6), (C_eng or None), vf (float), timings (float seconds)
+
+    NOTE: respects args.save_outputs (0/1) to skip file writes.
+    """
     out = args.out_prefix
+    save_outputs = bool(int(getattr(args, "save_outputs", 1)))
+
+    verbose = bool(int(getattr(args, "verbose", 1)))
+
+    def vprint(*a, **k):
+        if verbose:
+            print(*a, **k)
+
 
     t_all = time.perf_counter()
 
     # ---------- Step 1: mesh + Voronoi edges + φ ----------
-    print("=== Step 1: Mesh + Voronoi-driven level-set φ ===")
+    vprint("=== Step 1: Mesh + Voronoi-driven level-set φ ===")
     mesh = df.UnitCubeMesh(args.nx, args.ny, args.nz)
 
     importlib.reload(VOR)
@@ -382,13 +407,21 @@ def main():
     VOR.REPL_MODE   = args.repl_mode
     VOR.CUT_TO_UNIT = bool(args.cut_to_unit)
 
-    # ---- inject user-defined points A/B/C + rest ----
+    # VOR.VERBOSE = bool(verbose)
+    # VOR.EXPORT_OBJ = bool(save_outputs)      # když nic neukládáš, nevypisuj a nepiš obj
+    # VOR.CHECK_PERIODICITY = bool(verbose)    # periodic check log jen když verbose
+    VOR.VERBOSE = False
+    VOR.EXPORT_OBJ = False
+    VOR.CHECK_PERIODICITY = False
+
+
+
+    # inject A/B/C + rest
     if int(args.fixed_abc) == 1:
         A = mod1(np.array(args.A, float))
         B = mod1(np.array(args.B, float))
         C = mod1(np.array(args.C, float))
         pts = [A, B, C]
-        # Fill remaining seeds if required
         if args.n_points > 3:
             rng = np.random.default_rng(args.seed+123)
             while len(pts) < args.n_points:
@@ -396,12 +429,12 @@ def main():
                 if near_enough(x, pts, float(args.eps_rest)):
                     pts.append(mod1(x))
         VOR.USER_POINTS = np.vstack(pts)
-        print(f"  Using fixed seeds: A={A}, B={B}, C={C}; total N={len(VOR.USER_POINTS)}")
+        vprint(f"  Using fixed seeds: A={A}, B={B}, C={C}; total N={len(VOR.USER_POINTS)}")
     else:
-        VOR.USER_POINTS = None  # fall back to module's own seeding
+        VOR.USER_POINTS = None
 
     verts, edges = VOR.get_periodic_edges()
-    print(f"  Voronoi: |verts|={len(verts)}, |edges|={len(edges)}  (REPL_MODE={VOR.REPL_MODE}, CUT_TO_UNIT={VOR.CUT_TO_UNIT})")
+    vprint(f"  Voronoi: |verts|={len(verts)}, |edges|={len(edges)}  (REPL_MODE={VOR.REPL_MODE}, CUT_TO_UNIT={VOR.CUT_TO_UNIT})")
 
     beams = _beams_from_voronoi_module(VOR, beam_diam=args.beam_diam)
 
@@ -410,22 +443,24 @@ def main():
         mesh, beams, k=args.k, cell=args.hash_cell,
         qorder=args.qorder, progress=(not args.no_progress)
     )
-    print(f"  φ painting done in {time.perf_counter()-t1:.2f}s")
+    vprint(f"  φ painting done in {time.perf_counter()-t1:.2f}s")
 
     phi.rename("phi", "levelset")
-    dump_beams_obj(beams, f"{out}_beams_used.obj")
+    if save_outputs:
+        dump_beams_obj(beams, f"{out}_beams_used.obj")
     probe_phi_on_beams(phi, beams)
 
-    with df.XDMFFile(mesh.mpi_comm(), f"{out}_phi.xdmf") as xdmf:
-        xdmf.parameters["functions_share_mesh"] = True
-        xdmf.parameters["flush_output"] = False
-        xdmf.write(mesh); xdmf.write(phi)
     vals = phi.compute_vertex_values(mesh)
-    print(f"  φ: min={vals.min():.4f}, max={vals.max():.4f}, mean≈{vals.mean():.4f}")
-    print(f"  ✓ Saved: {out}_phi.xdmf")
+    vprint(f"  φ: min={vals.min():.4f}, max={vals.max():.4f}, mean≈{vals.mean():.4f}")
+    if save_outputs:
+        with df.XDMFFile(mesh.mpi_comm(), f"{out}_phi.xdmf") as xdmf:
+            xdmf.parameters["functions_share_mesh"] = True
+            xdmf.parameters["flush_output"] = False
+            xdmf.write(mesh); xdmf.write(phi)
+        vprint(f"  ✓ Saved: {out}_phi.xdmf")
 
     # ---------- Step 2: smooth interpolation s(φ) ----------
-    print("=== Step 2: Smooth material interpolation E(x) from φ ===")
+    vprint("=== Step 2: Smooth material interpolation E(x) from φ ===")
     t2 = time.perf_counter()
 
     Vphi  = phi.function_space()
@@ -436,28 +471,61 @@ def main():
     s_phi.vector().set_local(arr); s_phi.vector().apply("insert")
 
     svals = s_phi.compute_vertex_values(mesh)
-    print(f"  s(φ): min={svals.min():.4f}, max={svals.max():.4f}, mean≈{svals.mean():.4f}")
-    vol   = domain_volume(mesh)
-    vf    = df.assemble(s_phi*df.dx(mesh)) / vol
-    print(f"  volume fraction (≈⟨s(φ)⟩): {vf:.4f}")
+    vprint(f"  s(φ): min={svals.min():.4f}, max={svals.max():.4f}, mean≈{svals.mean():.4f}")
 
-    with df.XDMFFile(mesh.mpi_comm(), f"{out}_sphi.xdmf") as xdmf:
-        xdmf.parameters["functions_share_mesh"] = True
-        xdmf.parameters["flush_output"] = False
-        xdmf.write(mesh); xdmf.write(s_phi)
-    print(f"  ✓ Saved: {out}_sphi.xdmf")
+    vol = domain_volume(mesh)
+    vf  = df.assemble(s_phi*df.dx(mesh)) / vol
+    vprint(f"  volume fraction (≈⟨s(φ)⟩): {vf:.4f}")
 
-    # Material fields
+    if save_outputs:
+        with df.XDMFFile(mesh.mpi_comm(), f"{out}_sphi.xdmf") as xdmf:
+            xdmf.parameters["functions_share_mesh"] = True
+            xdmf.parameters["flush_output"] = False
+            xdmf.write(mesh); xdmf.write(s_phi)
+        vprint(f"  ✓ Saved: {out}_sphi.xdmf")
+
     E_void  = df.Constant(args.E_void)
     E_solid = df.Constant(args.E_solid)
     nu      = df.Constant(args.nu)
     E_field = E_void + (E_solid - E_void) * s_phi
     lam, mu = lame_from_E_nu(E_field, nu)
 
-    print(f"  smoothing/material done in {time.perf_counter()-t2:.2f}s")
+    # ---------- DG0 space and container for maps ----------
+    want_energy = bool(int(getattr(args, "return_energy", 0)))
+    V0 = df.FunctionSpace(mesh, "DG", 0) if want_energy else None
+    energy_maps = {}  # label -> DG0 Function
+
+    rho0 = None
+    if want_energy:
+        rho0 = df.project(s_phi, V0)      # DG0 (cell-wise) version of material field
+        rho0.rename("rho0", "rho0")
+        energy_maps["rho0"] = rho0
+
+
+
+    vprint(f"  smoothing/material done in {time.perf_counter()-t2:.2f}s")
+
+    # --- If engine is provided, reuse cached FE structures for Step 3+4 ---
+    if engine is not None:
+        # IMPORTANT: engine must be built with same (nx,ny,nz)
+        # Compute C and (optionally) energy maps using engine
+        C_sym, mapsE = engine.homogenize(lam, mu, want_energy=want_energy, timings=None)
+
+        # Add energy maps from engine (E11/E22/E33). Also keep rho0 from this run.
+        if want_energy:
+            # rho0 already computed in this run (project(s_phi,V0)) and saved to energy_maps
+            # merge energies from engine:
+            energy_maps["E11"] = mapsE.get("E11")
+            energy_maps["E22"] = mapsE.get("E22")
+            energy_maps["E33"] = mapsE.get("E33")
+
+        total_dt = time.perf_counter() - t_all
+        # Return early (skip old Step 3+4 below)
+        return C_sym, None, float(vf), float(total_dt), (energy_maps if want_energy else None)
+
 
     # ---------- Step 3: Homogenization cell problem (SPD + nullspace) ----------
-    print("=== Step 3: Homogenization cell problem (SPD + nullspace) ===")
+    vprint("=== Step 3: Homogenization cell problem (SPD + nullspace) ===")
     t3 = time.perf_counter()
 
     pbc = PeriodicBoundary(mesh)
@@ -469,13 +537,10 @@ def main():
     x = df.SpatialCoordinate(mesh)
 
     a_spd = df.inner(stress(w, lam, mu), strain(v)) * df.dx(mesh)
-    print("  assembling SPD A (once)...", end="", flush=True)
+    vprint("  assembling SPD A (once)...", end="", flush=True)
     Aop = df.assemble(a_spd)
-    print(" done.")
+    vprint(" done.")
 
-
-    # TEST
-    # Nullspace of translations
     rb = []
     for i in range(3):
         e = [0.0, 0.0, 0.0]; e[i] = 1.0
@@ -506,14 +571,13 @@ def main():
     solver.parameters["monitor_convergence"] = False
     solver.set_operator(Aop)
 
-    # Preallocate/reuse RHS and solution
     b = df.Vector(mesh.mpi_comm())
     try:
         Aop.init_vector(b, 0)
     except Exception:
         df.as_backend_type(Aop).init_vector(b, 0)
 
-    w_sol = df.Function(Vp)  # reused
+    w_sol = df.Function(Vp)
 
     def solve_rhs(u_aff, label, save_w=False):
         L = - df.inner(stress(u_aff, lam, mu), strain(v)) * df.dx(mesh)
@@ -526,6 +590,24 @@ def main():
         dt = time.perf_counter() - t0
 
         sig = stress(w_sol + u_aff, lam, mu)
+
+        # --- optional: cell-wise strain energy for semi-adjoint ---
+        Ecell = None
+        if want_energy and label in ("E11", "E22", "E33"):
+            u_tot = w_sol + u_aff
+            sig_tot = stress(u_tot, lam, mu)
+            eps_tot = strain(u_tot)
+
+            # energy density (per volume): 0.5 * eps:sigma
+            # For ranking/sensitivity, 0.5 factor is irrelevant, but keep it.
+            edens = 0.5 * df.inner(sig_tot, eps_tot)
+
+            Ecell = df.Function(V0)
+            # project into DG0 (cell-wise constant)
+            Ecell.assign(df.project(edens, V0))
+            Ecell.rename("Ecell", f"Ecell_{label}")
+
+
         Sbar = np.zeros((3,3))
         for i in range(3):
             for j in range(3):
@@ -533,109 +615,254 @@ def main():
 
         mw  = mean_vector(w_sol, mesh)
         wL2 = df.assemble(df.inner(w_sol, w_sol)*df.dx(mesh))**0.5
-        print(f"  {label}: CG+AMG {dt:.2f}s | ⟨σ⟩ diag="
+        vprint(f"  {label}: CG+AMG {dt:.2f}s | ⟨σ⟩ diag="
               + " ".join(f"{Sbar[d,d]:.4e}" for d in range(3))
               + f" | ||w||={wL2:.3e} | ⟨w⟩=({mw[0]:+.1e},{mw[1]:+.1e},{mw[2]:+.1e})")
 
-        if save_w:
+        if save_outputs and save_w:
             with df.XDMFFile(mesh.mpi_comm(), f"{out}_w_{label}.xdmf") as xdmf:
                 xdmf.parameters["functions_share_mesh"] = True
                 xdmf.parameters["flush_output"] = False
                 xdmf.write(mesh)
                 w_sol.rename("w", f"w_{label}")
                 xdmf.write(w_sol)
-        return w_sol, Sbar
+        return w_sol, Sbar, Ecell
 
-    # ---- E11 first (save)
-    vol = domain_volume(mesh)
+    # E11 first
     u_aff_E11 = affine_field("E11", x)
-    w_E11, Sbar_E11 = solve_rhs(u_aff_E11, "E11", save_w=True)
-    print(f"  SPD E11 done in {time.perf_counter()-t3:.2f}s")
+    # _, Sbar_E11 = solve_rhs(u_aff_E11, "E11", save_w=True)
+    # w11, Sbar_E11, Ecell_E11 = solve_rhs(u_aff_E11, "E11", save_w=True)
+    _, Sbar_E11, Ecell_E11 = solve_rhs(u_aff_E11, "E11", save_w=True)
+    if want_energy and Ecell_E11 is not None:
+        energy_maps["E11"] = Ecell_E11
+    vprint(f"  SPD E11 done in {time.perf_counter()-t3:.2f}s")
 
     # ---------- Step 4: Full homogenized stiffness C̄ ----------
-    print("=== Step 4: Full homogenized stiffness C̄ (Voigt 6×6, tensorial shear) ===")
-    t4 = time.perf_counter()
-
+    vprint("=== Step 4: Full homogenized stiffness C̄ (Voigt 6×6, tensorial shear) ===")
     labels = ["E11","E22","E33","E12","E13","E23"]
     Ccols  = [np.array([Sbar_E11[0,0], Sbar_E11[1,1], Sbar_E11[2,2],
                         Sbar_E11[0,1], Sbar_E11[0,2], Sbar_E11[1,2]], float)]
-
     for lab in ["E22","E33","E12","E13","E23"]:
         u_aff = affine_field(lab, x)
         save_this = bool(args.save_w_all)
-        _, Sbar = solve_rhs(u_aff, lab, save_w=save_this)
+
+        _, Sbar, Ecell = solve_rhs(u_aff, lab, save_w=save_this)
+
+        if want_energy and (Ecell is not None) and lab in ("E22", "E33"):
+            energy_maps[lab] = Ecell
+
         Ccols.append(np.array([Sbar[0,0], Sbar[1,1], Sbar[2,2],
                                Sbar[0,1], Sbar[0,2], Sbar[1,2]], float))
+
 
     C_ten = np.column_stack(Ccols)
     C_sym = 0.5*(C_ten + C_ten.T)
     asym  = np.abs(C_ten - C_ten.T).max()
 
-    print("  Max |C - C^T| (symmetry defect):", f"{asym:.3e}")
-    print("  C̄ (tensorial Voigt [11,22,33,12,13,23]):")
+    vprint("  Max |C - C^T| (symmetry defect):", f"{asym:.3e}")
+    vprint("  C̄ (tensorial Voigt [11,22,33,12,13,23]):")
     for i in range(6):
-        print("   ", " ".join(f"{C_sym[i,j]: .4e}" for j in range(6)))
+        vprint("   ", " ".join(f"{C_sym[i,j]: .4e}" for j in range(6)))
 
+    C_eng = None
     if int(args.voigt_eng) == 1:
         Tinv = np.diag([1,1,1,0.5,0.5,0.5])
         C_eng = C_sym @ Tinv
-        print("  C̄ (engineering Voigt; shears use γ=2ε):")
+        vprint("  C̄ (engineering Voigt; shears use γ=2ε):")
         for i in range(6):
-            print("   ", " ".join(f"{C_eng[i,j]: .4e}" for j in range(6)))
+            vprint("   ", " ".join(f"{C_eng[i,j]: .4e}" for j in range(6)))
 
-    np.savetxt(f"{out}_Cbar_tensor.csv", C_sym, delimiter=",")
-    np.save(   f"{out}_Cbar_tensor.npy", C_sym)
-    if int(args.voigt_eng) == 1:
-        np.savetxt(f"{out}_Cbar_engineering.csv", C_eng, delimiter=",")
-        print(f"  ✓ Saved: {out}_Cbar_engineering.csv")
-    print(f"  ✓ Saved: {out}_Cbar_tensor.csv (+ .npy)")
+    if save_outputs:
+        np.savetxt(f"{out}_Cbar_tensor.csv", C_sym, delimiter=",")
+        np.save(   f"{out}_Cbar_tensor.npy", C_sym)
+        if int(args.voigt_eng) == 1 and C_eng is not None:
+            np.savetxt(f"{out}_Cbar_engineering.csv", C_eng, delimiter=",")
+            vprint(f"  ✓ Saved: {out}_Cbar_engineering.csv")
+        vprint(f"  ✓ Saved: {out}_Cbar_tensor.csv (+ .npy)")
 
-    # -------- Summary line with parameters + 21 independent C coeffs + total time
+        # Summary (same as before)
+        total_dt = time.perf_counter() - t_all
+        C21 = [C_sym[i, j] for i in range(6) for j in range(i, 6)]
+        label = (
+            f"Voronoi(N={args.n_points}, rmin={args.r_min}, rmax={args.r_max}, seed={args.seed}, "
+            f"blocks={args.blocks}, repl={args.repl_mode}, cut={int(args.cut_to_unit)}) | "
+            f"lvlset(d={args.beam_diam}, k={args.k}, h={args.hash_cell}, beta={args.beta}, "
+            f"thr={args.thresh}, vf={vf:.4f}) | mesh={args.nx}x{args.ny}x{args.nz} | q={args.qorder}"
+            + ("" if int(args.fixed_abc)==0 else
+               f" | ABC(A={tuple(mod1(np.array(args.A,float)))}, B={tuple(mod1(np.array(args.B,float)))}, C={tuple(mod1(np.array(args.C,float)))}, epsR={args.eps_rest})")
+        )
+        vprint(label)
+        vprint("= " + ",".join(f"{c:.6e}" for c in C21) + f", time={total_dt:.2f}s")
+
+        summary_path = f"{out}_summary.csv"
+        header_cols = [
+            "nx","ny","nz","qorder",
+            "N_POINTS","R_MIN","R_MAX","SEED","BLOCKS","REPL_MODE","CUT_TO_UNIT",
+            "BEAM_DIAM","K","HASH_CELL","BETA","THRESH","VF",
+            "E_SOLID","E_VOID","NU",
+            "FIXED_ABC","AX","AY","AZ","BX","BY","BZ","CX","CY","CZ","EPS_REST"
+        ] + [f"C{i+1}" for i in range(21)] + ["TIME_S"]
+
+        if int(args.fixed_abc)==1:
+            AX,AY,AZ = (mod1(np.array(args.A,float))).tolist()
+            BX,BY,BZ = (mod1(np.array(args.B,float))).tolist()
+            CX,CY,CZ = (mod1(np.array(args.C,float))).tolist()
+            FIXED_FLAG = 1
+        else:
+            AX=AY=AZ=BX=BY=BZ=CX=CY=CZ=""
+            FIXED_FLAG = 0
+
+        row_vals = [
+            args.nx, args.ny, args.nz, args.qorder,
+            args.n_points, args.r_min, args.r_max, args.seed, args.blocks, args.repl_mode, int(args.cut_to_unit),
+            args.beam_diam, args.k, args.hash_cell, args.beta, args.thresh, float(vf),
+            args.E_solid, args.E_void, args.nu,
+            FIXED_FLAG, AX, AY, AZ, BX, BY, BZ, CX, CY, CZ, args.eps_rest
+        ] + [float(v) for v in C21] + [float(total_dt)]
+
+        write_header = not os.path.exists(summary_path)
+        with open(summary_path, "a") as f:
+            if write_header:
+                f.write(",".join(map(str, header_cols)) + "\n")
+            f.write(",".join(map(str, row_vals)) + "\n")
+        vprint(f"  ✓ Appended summary row → {summary_path}")
+
     total_dt = time.perf_counter() - t_all
-    C21 = [C_sym[i, j] for i in range(6) for j in range(i, 6)]
-    label = (
-        f"Voronoi(N={args.n_points}, rmin={args.r_min}, rmax={args.r_max}, seed={args.seed}, "
-        f"blocks={args.blocks}, repl={args.repl_mode}, cut={int(args.cut_to_unit)}) | "
-        f"lvlset(d={args.beam_diam}, k={args.k}, h={args.hash_cell}, beta={args.beta}, "
-        f"thr={args.thresh}, vf={vf:.4f}) | mesh={args.nx}x{args.ny}x{args.nz} | q={args.qorder}"
-        + ("" if int(args.fixed_abc)==0 else
-           f" | ABC(A={tuple(mod1(np.array(args.A,float)))}, B={tuple(mod1(np.array(args.B,float)))}, C={tuple(mod1(np.array(args.C,float)))}, epsR={args.eps_rest})")
-    )
-    print(label)
-    print("= " + ",".join(f"{c:.6e}" for c in C21) + f", time={total_dt:.2f}s")
-
-    summary_path = f"{out}_summary.csv"
-    header_cols = [
-        "nx","ny","nz","qorder",
-        "N_POINTS","R_MIN","R_MAX","SEED","BLOCKS","REPL_MODE","CUT_TO_UNIT",
-        "BEAM_DIAM","K","HASH_CELL","BETA","THRESH","VF",
-        "E_SOLID","E_VOID","NU",
-        "FIXED_ABC","AX","AY","AZ","BX","BY","BZ","CX","CY","CZ","EPS_REST"
-    ] + [f"C{i+1}" for i in range(21)] + ["TIME_S"]
-
-    if int(args.fixed_abc)==1:
-        AX,AY,AZ = (mod1(np.array(args.A,float))).tolist()
-        BX,BY,BZ = (mod1(np.array(args.B,float))).tolist()
-        CX,CY,CZ = (mod1(np.array(args.C,float))).tolist()
-        FIXED_FLAG = 1
+    if want_energy:
+        return C_sym, C_eng, float(vf), float(total_dt), energy_maps
     else:
-        AX=AY=AZ=BX=BY=BZ=CX=CY=CZ=""
-        FIXED_FLAG = 0
+        return C_sym, C_eng, float(vf), float(total_dt), None
 
-    row_vals = [
-        args.nx, args.ny, args.nz, args.qorder,
-        args.n_points, args.r_min, args.r_max, args.seed, args.blocks, args.repl_mode, int(args.cut_to_unit),
-        args.beam_diam, args.k, args.hash_cell, args.beta, args.thresh, float(vf),
-        args.E_solid, args.E_void, args.nu,
-        FIXED_FLAG, AX, AY, AZ, BX, BY, BZ, CX, CY, CZ, args.eps_rest
-    ] + [float(v) for v in C21] + [float(total_dt)]
 
-    write_header = not os.path.exists(summary_path)
-    with open(summary_path, "a") as f:
-        if write_header:
-            f.write(",".join(map(str, header_cols)) + "\n")
-        f.write(",".join(map(str, row_vals)) + "\n")
-    print(f"  ✓ Appended summary row → {summary_path}")
+
+
+
+
+def compute_C_from_ABC(A, B, C, *, out_prefix="inprocess", save_outputs=False, engine=None, **kwargs):
+    """
+    Convenience wrapper for optimization:
+      A,B,C: iterable length-3
+      kwargs: any CLI-style settings, e.g. nx=20, ny=20, ...
+    Returns:
+      C_sym (6x6), vf (float)
+    """
+    ap = build_argparser()
+    args = ap.parse_args([])  # start from defaults without CLI
+    args.out_prefix = out_prefix
+    args.save_outputs = 1 if save_outputs else 0
+
+    # set A/B/C and force fixed-abc
+    args.fixed_abc = 1
+    args.A = list(map(float, A))
+    args.B = list(map(float, B))
+    args.C = list(map(float, C))
+
+    # override any provided kwargs (nx, beta, etc.)
+    for k, v in kwargs.items():
+        if not hasattr(args, k.replace("-", "_")) and not hasattr(args, k):
+            # allow both "n-points" and "n_points" style keys
+            pass
+        key = k.replace("-", "_")
+        if hasattr(args, key):
+            setattr(args, key, v)
+        elif hasattr(args, k):
+            setattr(args, k, v)
+        else:
+            raise AttributeError(f"Unknown setting '{k}' for homog args.")
+
+    C_sym, _, vf, _, energy_maps = run_homog(args, engine=engine)
+    return C_sym, vf, energy_maps
+
+def compute_rho0_from_ABC(
+    A, B, C, *,
+    nx=20, ny=20, nz=20,
+    n_points=3, eps_rest=0.03,
+    beam_diam=0.06,
+    beta=10.0, thresh=0.5,
+    k=100.0, hash_cell=0.08,
+    qorder=1,
+    seed=8, blocks=4, repl_mode=26, cut_to_unit=True,
+    no_progress=True,
+    verbose=0,
+    reload_vor=False,          # <-- NOVÉ: defaultně nere-loaduje
+    r_min=0.1, r_max=0.2       # <-- NOVÉ: explicitně nastavujeme radii
+):
+    """
+    Geometry-only pipeline:
+    returns (rho0_dg0_numpy, mesh, V0) without homogenization solves.
+    """
+
+    # mesh (fixed)
+    mesh = df.UnitCubeMesh(nx, ny, nz)
+
+    # --- Voronoi config ---
+    if reload_vor:
+        importlib.reload(VOR)
+
+    # nastav vždy parametry (bez ohledu na reload)
+    VOR.N_POINTS    = n_points
+    VOR.R_MIN       = r_min
+    VOR.R_MAX       = r_max
+    VOR.SEED        = seed
+    VOR.BLOCKS      = blocks
+    VOR.REPL_MODE   = str(repl_mode)
+    VOR.CUT_TO_UNIT = bool(cut_to_unit)
+
+    # tichý režim + žádný OBJ export (pro optimalizaci)
+    VOR.VERBOSE = bool(verbose)
+    VOR.EXPORT_OBJ = False
+    VOR.CHECK_PERIODICITY = False
+
+    # --- fixed seeds A/B/C + optional rest ---
+    A = mod1(np.array(A, float))
+    B = mod1(np.array(B, float))
+    C = mod1(np.array(C, float))
+    pts = [A, B, C]
+
+    if n_points > 3:
+        rng = np.random.default_rng(seed + 123)
+        while len(pts) < n_points:
+            x = rng.random(3)
+            if near_enough(x, pts, float(eps_rest)):
+                pts.append(mod1(x))
+
+    VOR.USER_POINTS = np.vstack(pts)
+
+    # Voronoi edges -> beams
+    _verts, _edges = VOR.get_periodic_edges()
+    beams = _beams_from_voronoi_module(VOR, beam_diam=beam_diam)
+
+    # phi
+    phi = indicator_from_voronoi_edges_numpy_L2(
+        mesh, beams, k=k, cell=hash_cell, qorder=qorder,
+        progress=(not no_progress)
+    )
+    phi.rename("phi", "levelset")
+
+    # s(phi)
+    Vphi  = phi.function_space()
+    s_phi = df.Function(Vphi)
+    arr = phi.vector().get_local()
+    arr = 1.0 / (1.0 + np.exp(-float(beta)*(arr - float(thresh))))
+    arr = np.clip(arr, 0.0, 1.0)
+    s_phi.vector().set_local(arr)
+    s_phi.vector().apply("insert")
+
+    # DG0 projection
+    V0 = df.FunctionSpace(mesh, "DG", 0)
+    rho0 = df.project(s_phi, V0)
+
+    return rho0.vector().get_local(), mesh, V0
+
+
+
+
+# ================================ main ===================================
+def main():
+    ap = build_argparser()
+    args = ap.parse_args()
+    run_homog(args)
+
 
 if __name__ == "__main__":
     main()

@@ -10,7 +10,16 @@ SHIFT_DIR                    = 0      # 0=no extra duplicate; ±1=±X, ±2=±Y, 
 OUT   = pathlib.Path("cells_obj"); OUT.mkdir(exist_ok=True)
 TOL   = 1e-6                 # tolerance for coordinate matching (periodicity check)
 USER_POINTS = None           # if not None: use this (M,3) in [0,1) instead of RNG
+VERBOSE = True               # printy / logy
+EXPORT_OBJ = True            # ukládat edges_clean.obj
+CHECK_PERIODICITY = True     # dělat periodic check (počítá se vždy, ale log a kontrola se dá vypnout)
+
 # -----------------------------------------------------------------------
+
+def vprint(*a, **k):
+    if VERBOSE:
+        print(*a, **k)
+
 
 def _wrap01(pts):
     """Wrap to [0,1) torus."""
@@ -177,15 +186,17 @@ def get_periodic_edges():
         'y': missing('y0','y1') + missing('y1','y0'),
         'z': missing('z0','z1') + missing('z1','z0')
     }
-    print(f"REPL_MODE: {REPL_MODE} | CUT_TO_UNIT: {CUT_TO_UNIT}")
-    print("Periodic check – missing opposite twins:", miss)
+    if CHECK_PERIODICITY:
+        vprint(f"REPL_MODE: {REPL_MODE} | CUT_TO_UNIT: {CUT_TO_UNIT}")
+        vprint("Periodic check – missing opposite twins:", miss)
 
     # 6) OBJ export (clean edges only)
-    with open(OUT / "edges_clean.obj", "w") as f:
-        for v in verts:
-            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
-        for i, j in sorted(edges):
-            f.write(f"l {i} {j}\n")
-    print("✅  edges_clean.obj stored in", OUT.resolve())
+    if EXPORT_OBJ:
+        with open(OUT / "edges_clean.obj", "w") as f:
+            for v in verts:
+                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+            for i, j in sorted(edges):
+                f.write(f"l {i} {j}\n")
+        vprint("✅  edges_clean.obj stored in", OUT.resolve())
 
     return [np.asarray(v, float) for v in verts], sorted(edges)
